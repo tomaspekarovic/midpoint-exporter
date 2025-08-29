@@ -1,75 +1,90 @@
-name: Build & Release (Linux)
+name: Build & Release (Linux, manylinux2014)
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
   contents: write
 
 env:
+  # 👇 Change these if your file/name differ
   ENTRYPOINT: exporter.py
-  BINARY_NAME: midpoint-exporter
+  BINARY_NAME_FILE: midpoint_exporter         # filename inside dist/
+  ASSET_BASENAME: midpoint-exporter           # nice name on the release
 
 jobs:
   build-linux:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout tag
+      - name: Determine tag/ref
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "TAG=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "TAG=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout tagged ref
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref_name }}
+          ref: ${{ steps.tag.outputs.TAG }}
 
       - name: Verify entrypoint exists
         run: |
-          if [ ! -f "$ENTRYPOINT" ]; then
-            echo "ERROR: $ENTRYPOINT not found in repo root."
-            echo "Repo tree:"
-            ls -lah
-            exit 1
-          fi
+          test -f "$ENTRYPOINT" || { echo "ERROR: $ENTRYPOINT not found"; ls -lah; exit 1; }
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.9"
-
-      - name: Install deps
+      - name: Build in manylinux2014 (x86_64)
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install pyinstaller requests prometheus_client
-          fi
+          set -euo pipefail
+          docker run --rm -v "$PWD":/io -w /io quay.io/pypa/manylinux2014_x86_64 bash -exc '
+            PYBIN=/opt/python/cp39-cp39/bin/python
+            $PYBIN -m pip install --no-cache-dir --upgrade pip
+            if [ -f requirements.txt ]; then
+              $PYBIN -m pip install --no-cache-dir -r requirements.txt
+            else
+              $PYBIN -m pip install --no-cache-dir pyinstaller requests prometheus_client
+            fi
+            /opt/python/cp39-cp39/bin/pyinstaller --onefile --strip --clean \
+              --name "$BINARY_NAME_FILE" "$ENTRYPOINT"
+            ls -lah dist
+            chown -R $(stat -c "%u:%g" /io) /io/dist
+          '
 
-      - name: Build with PyInstaller
-        run: |
-          pyinstaller --onefile --name "$BINARY_NAME" "$ENTRYPOINT"
-          ls -lah dist
-
-      - name: Package & checksums
+      - name: Package & checksum (linux-amd64)
         id: pack
         shell: bash
         run: |
           set -euo pipefail
-          ARCH="$(python -c 'import platform; m=platform.machine().lower(); print("arm64" if m in ("aarch64","arm64") else ("amd64" if m in ("x86_64","amd64") else m))')"
-          OUT="${BINARY_NAME}-linux-${ARCH}"
-          cp "dist/${BINARY_NAME}" "$OUT"
+          SRC="dist/${BINARY_NAME_FILE}"
+          test -f "$SRC" || { echo "No binary at $SRC"; exit 1; }
+          OUT="${ASSET_BASENAME}-linux-amd64"
+          cp "$SRC" "$OUT"
           chmod +x "$OUT"
-          sha256sum "$OUT" > "SHA256SUM-linux-${ARCH}.txt"
+          sha256sum "$OUT" > "SHA256SUM-linux-amd64.txt"
           echo "bin=$OUT" >> "$GITHUB_OUTPUT"
-          echo "sum=SHA256SUM-linux-${ARCH}.txt" >> "$GITHUB_OUTPUT"
+          echo "sum=SHA256SUM-linux-amd64.txt" >> "$GITHUB_OUTPUT"
 
-      - name: Create/Update GitHub Release (attach files)
+      - name: Ensure release exists
+        if: ${{ github.event_name != 'release' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "${{ steps.tag.outputs.TAG }}" >/dev/null 2>&1 || \
+          gh release create "${{ steps.tag.outputs.TAG }}" \
+            --title "${{ steps.tag.outputs.TAG }}" \
+            --notes "Automated release for ${{ steps.tag.outputs.TAG }}"
+        shell: bash
+
+      - name: Upload assets to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          generate_release_notes: true
+          tag_name: ${{ steps.tag.outputs.TAG }}
           files: |
-            ${{ steps.pack.outputs.BIN }}
-            ${{ steps.pack.outputs.SUM }}
+            ${{ steps.pack.outputs.bin }}
+            ${{ steps.pack.outputs.sum }}
