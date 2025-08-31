@@ -6,9 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write    # needed to create GitHub Releases
-  packages: write    # (optional) for GHCR if you enable the image job
-  id-token: write    # (optional) for future provenance/SLSA
+  contents: write
 
 env:
   BINARY_NAME: midpoint_exporter
@@ -24,7 +22,7 @@ jobs:
         goarch: [amd64, arm64]
         exclude:
           - goos: darwin
-            goarch: amd64   # remove this line if you want darwin/amd64 too
+            goarch: amd64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,7 +33,7 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Run tests
+      - name: Test
         run: go test ./...
 
       - name: Build
@@ -45,46 +43,38 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           VERSION: ${{ github.ref_name }}
         run: |
-          # If you define 'var version = "dev"' in package main, this will embed the tag:
-          LDFLAGS="-s -w -X 'main.version=${VERSION}'"
+          set -euo pipefail
+          mkdir -p dist
           OUT="${{ env.BINARY_NAME }}"
           if [ "${GOOS}" = "windows" ]; then OUT="${OUT}.exe"; fi
+          LDFLAGS="-s -w -X 'main.version=${VERSION}'"
           go build -trimpath -ldflags "$LDFLAGS" -o "dist/${OUT}" .
+          test -s "dist/${OUT}"  # ensure non-empty
 
       - name: Package
         run: |
-          set -e
+          set -euo pipefail
           OS="${{ matrix.goos }}"
           ARCH="${{ matrix.goarch }}"
           VERSION="${{ github.ref_name }}"
-
           mkdir -p dist/pkgs
           BASENAME="${{ env.BINARY_NAME }}_${VERSION}_${OS}_${ARCH}"
-
-          # Include minimal README note; adjust if you have a real README/LICENSE in repo.
           echo "# ${{ env.BINARY_NAME }} ${VERSION}" > dist/README.release.txt
           echo "Built for ${OS}/${ARCH}" >> dist/README.release.txt
 
           if [ "${OS}" = "windows" ]; then
             zip -j "dist/pkgs/${BASENAME}.zip" "dist/${{ env.BINARY_NAME }}.exe" dist/README.release.txt
+            test -s "dist/pkgs/${BASENAME}.zip"
           else
             tar -C dist -czf "dist/pkgs/${BASENAME}.tar.gz" "${{ env.BINARY_NAME }}" README.release.txt
+            test -s "dist/pkgs/${BASENAME}.tar.gz"
           fi
 
-      - name: Generate checksum for package
-        working-directory: dist/pkgs
-        run: |
-          shopt -s nullglob
-          for f in *; do
-            sha256sum "$f" >> SHA256SUMS
-          done
-
-      - name: Upload build artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: release-artifacts-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: |
-            dist/pkgs/*
+          path: dist/pkgs/*
           if-no-files-found: error
 
   release:
@@ -99,21 +89,36 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Collate checksums
+      - name: Verify archives exist and are non-empty
         working-directory: artifacts
         run: |
-          cat */SHA256SUMS > SHA256SUMS || true
-          # dedupe if multiple files exist
-          sort -u -o SHA256SUMS SHA256SUMS || true
+          set -euo pipefail
+          shopt -s nullglob
+          files=(*.tar.gz *.zip)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No release archives found"; exit 1
+          fi
+          # ensure none are zero bytes
+          for f in "${files[@]}"; do
+            test -s "$f" || { echo "Empty file: $f"; exit 1; }
+          done
+
+      - name: Generate SHA256SUMS (only for existing archives)
+        id: sums
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+          test -s SHA256SUMS
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }} # e.g. v1.2.3-rc1 -> prerelease
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
-            artifacts/**/*.tar.gz
-            artifacts/**/*.zip
-            artifacts/**/SHA256SUMS
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/SHA256SUMS
           generate_release_notes: true
