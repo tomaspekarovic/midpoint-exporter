@@ -1,90 +1,119 @@
-name: Build & Release (Linux, manylinux2014)
+name: Release
 
 on:
   push:
-    tags: ["v*"]
-  release:
-    types: [published]
-  workflow_dispatch:
+    tags:
+      - "v*"
 
 permissions:
-  contents: write
+  contents: write    # needed to create GitHub Releases
+  packages: write    # (optional) for GHCR if you enable the image job
+  id-token: write    # (optional) for future provenance/SLSA
 
 env:
-  # 👇 Change these if your file/name differ
-  ENTRYPOINT: exporter.py
-  BINARY_NAME_FILE: midpoint_exporter         # filename inside dist/
-  ASSET_BASENAME: midpoint-exporter           # nice name on the release
+  BINARY_NAME: midpoint_exporter
 
 jobs:
-  build-linux:
+  build:
+    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
     runs-on: ubuntu-latest
-
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, darwin, windows]
+        goarch: [amd64, arm64]
+        exclude:
+          - goos: darwin
+            goarch: amd64   # remove this line if you want darwin/amd64 too
     steps:
-      - name: Determine tag/ref
-        id: tag
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ github.ref_name }}
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            echo "TAG=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          # If you define 'var version = "dev"' in package main, this will embed the tag:
+          LDFLAGS="-s -w -X 'main.version=${VERSION}'"
+          OUT="${{ env.BINARY_NAME }}"
+          if [ "${GOOS}" = "windows" ]; then OUT="${OUT}.exe"; fi
+          go build -trimpath -ldflags "$LDFLAGS" -o "dist/${OUT}" .
+
+      - name: Package
+        run: |
+          set -e
+          OS="${{ matrix.goos }}"
+          ARCH="${{ matrix.goarch }}"
+          VERSION="${{ github.ref_name }}"
+
+          mkdir -p dist/pkgs
+          BASENAME="${{ env.BINARY_NAME }}_${VERSION}_${OS}_${ARCH}"
+
+          # Include minimal README note; adjust if you have a real README/LICENSE in repo.
+          echo "# ${{ env.BINARY_NAME }} ${VERSION}" > dist/README.release.txt
+          echo "Built for ${OS}/${ARCH}" >> dist/README.release.txt
+
+          if [ "${OS}" = "windows" ]; then
+            zip -j "dist/pkgs/${BASENAME}.zip" "dist/${{ env.BINARY_NAME }}.exe" dist/README.release.txt
           else
-            echo "TAG=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            tar -C dist -czf "dist/pkgs/${BASENAME}.tar.gz" "${{ env.BINARY_NAME }}" README.release.txt
           fi
 
-      - name: Checkout tagged ref
-        uses: actions/checkout@v4
+      - name: Generate checksum for package
+        working-directory: dist/pkgs
+        run: |
+          shopt -s nullglob
+          for f in *; do
+            sha256sum "$f" >> SHA256SUMS
+          done
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
         with:
-          ref: ${{ steps.tag.outputs.TAG }}
+          name: release-artifacts-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/pkgs/*
+          if-no-files-found: error
 
-      - name: Verify entrypoint exists
+  release:
+    name: Publish Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-artifacts-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Collate checksums
+        working-directory: artifacts
         run: |
-          test -f "$ENTRYPOINT" || { echo "ERROR: $ENTRYPOINT not found"; ls -lah; exit 1; }
+          cat */SHA256SUMS > SHA256SUMS || true
+          # dedupe if multiple files exist
+          sort -u -o SHA256SUMS SHA256SUMS || true
 
-      - name: Build in manylinux2014 (x86_64)
-        run: |
-          set -euo pipefail
-          docker run --rm -v "$PWD":/io -w /io quay.io/pypa/manylinux2014_x86_64 bash -exc '
-            PYBIN=/opt/python/cp39-cp39/bin/python
-            $PYBIN -m pip install --no-cache-dir --upgrade pip
-            if [ -f requirements.txt ]; then
-              $PYBIN -m pip install --no-cache-dir -r requirements.txt
-            else
-              $PYBIN -m pip install --no-cache-dir pyinstaller requests prometheus_client
-            fi
-            /opt/python/cp39-cp39/bin/pyinstaller --onefile --strip --clean \
-              --name "$BINARY_NAME_FILE" "$ENTRYPOINT"
-            ls -lah dist
-            chown -R $(stat -c "%u:%g" /io) /io/dist
-          '
-
-      - name: Package & checksum (linux-amd64)
-        id: pack
-        shell: bash
-        run: |
-          set -euo pipefail
-          SRC="dist/${BINARY_NAME_FILE}"
-          test -f "$SRC" || { echo "No binary at $SRC"; exit 1; }
-          OUT="${ASSET_BASENAME}-linux-amd64"
-          cp "$SRC" "$OUT"
-          chmod +x "$OUT"
-          sha256sum "$OUT" > "SHA256SUM-linux-amd64.txt"
-          echo "bin=$OUT" >> "$GITHUB_OUTPUT"
-          echo "sum=SHA256SUM-linux-amd64.txt" >> "$GITHUB_OUTPUT"
-
-      - name: Ensure release exists
-        if: ${{ github.event_name != 'release' }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release view "${{ steps.tag.outputs.TAG }}" >/dev/null 2>&1 || \
-          gh release create "${{ steps.tag.outputs.TAG }}" \
-            --title "${{ steps.tag.outputs.TAG }}" \
-            --notes "Automated release for ${{ steps.tag.outputs.TAG }}"
-        shell: bash
-
-      - name: Upload assets to release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.TAG }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }} # e.g. v1.2.3-rc1 -> prerelease
           files: |
-            ${{ steps.pack.outputs.bin }}
-            ${{ steps.pack.outputs.sum }}
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+            artifacts/**/SHA256SUMS
+          generate_release_notes: true
