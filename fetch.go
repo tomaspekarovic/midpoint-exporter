@@ -25,7 +25,8 @@ const (
 
 	ResourceUp      = 0
 	ResourceDown    = 1
-	ResourceUnknown = 2
+	ResourceBroken  = 2
+	ResourceUnknown = 3
 )
 
 var taskStatusMap = map[string]int{
@@ -113,53 +114,24 @@ func extractFirst(m map[string]any, keys ...string) (any, bool) {
 	return nil, false
 }
 
-func parseTimestamp(v any) (float64, bool) {
-	if v == nil {
+func parseTimestamp(raw any) (float64, bool) {
+	if raw == nil {
 		return 0, false
 	}
-	switch t := v.(type) {
-	case json.Number:
-		f, _ := t.Float64()
-		if f > 1e12 {
-			return f / 1000.0, true
-		}
-		return f, true
-	case float64:
-		if t > 1e12 {
-			return t / 1000.0, true
-		}
-		return t, true
-	case int64:
-		if t > 1e12 {
-			return float64(t) / 1000.0, true
-		}
-		return float64(t), true
+	switch v := raw.(type) {
 	case string:
-		s := strings.TrimSpace(t)
-		if isDigits(s) {
-			f, err := parseFloat(s)
-			if err == nil {
-				if f > 1e12 {
-					return f / 1000.0, true
-				}
-				return f, true
-			}
+		t, err := time.Parse(time.RFC3339Nano, v)
+		if err != nil {
+			return 0, false
 		}
-		// ISO8601 common layouts
-		layouts := []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05"}
-		for _, l := range layouts {
-			if ts, err := time.Parse(l, s); err == nil {
-				return float64(ts.Unix()), true
-			}
-			if strings.HasSuffix(s, "Z") {
-				s2 := strings.TrimSuffix(s, "Z") + "+00:00"
-				if ts, err := time.Parse(time.RFC3339, s2); err == nil {
-					return float64(ts.Unix()), true
-				}
-			}
-		}
+		return float64(t.UnixNano()) / 1e9, true // seconds with sub-second precision
+	case float64:
+		return v, true
+	case int64:
+		return float64(v), true
+	default:
+		return 0, false
 	}
-	return 0, false
 }
 
 // ---- Exporters ----
@@ -187,7 +159,8 @@ func exportTaskMetrics(m *Metrics, data map[string]any) {
 		if !ok {
 			status = TaskUnknown
 		}
-		m.taskStatus.WithLabelValues(name, oid, m.hostLabel, m.jobTasks, m.appLabel).Set(float64(status))
+		m.taskStatus.WithLabelValues(name, oid, m.hostLabel, m.jobTasks, m.appLabel).
+			Set(float64(status))
 
 		var startRaw, finishRaw any
 		if v, ok := extractFirst(task, "lastRunStartTimestamp", "lastRunStartedTimestamp"); ok {
@@ -196,8 +169,10 @@ func exportTaskMetrics(m *Metrics, data map[string]any) {
 		if v, ok := extractFirst(task, "lastRunFinishTimestamp", "lastRunStoppedTimestamp"); ok {
 			finishRaw = v
 		}
+
 		startTS, hasStart := parseTimestamp(startRaw)
 		finishTS, hasFinish := parseTimestamp(finishRaw)
+
 		var duration float64
 		var set bool
 		if hasStart && hasFinish && finishTS >= startTS {
@@ -209,7 +184,9 @@ func exportTaskMetrics(m *Metrics, data map[string]any) {
 			set = true
 		}
 		if set {
-			m.taskDuration.WithLabelValues(name, oid, m.hostLabel, m.jobTasks, m.appLabel).Set(duration)
+			duration = math.Round(duration*1000) / 1000
+			m.taskDuration.WithLabelValues(name, oid, m.hostLabel, m.jobTasks, m.appLabel).
+				Set(duration)
 		}
 	}
 }
@@ -240,6 +217,7 @@ func exportResourceMetrics(m *Metrics, data map[string]any) {
 		if !ok {
 			status = ResourceUnknown
 		}
+
 		m.resourceStatus.WithLabelValues(name, oid, m.hostLabel, m.jobResources, m.appLabel).Set(float64(status))
 	}
 }
