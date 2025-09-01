@@ -42,6 +42,7 @@ var taskStatusMap = map[string]int{
 var resourceStatusMap = map[string]int{
 	"up":      ResourceUp,
 	"down":    ResourceDown,
+	"broken":  ResourceBroken,
 	"unknown": ResourceUnknown,
 }
 
